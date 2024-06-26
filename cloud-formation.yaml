@@ -1,0 +1,282 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: something-random-1234
+    Description: Name prefix for all resources
+    AllowedPattern: '^[a-z](?:(?![-]{2,})[a-z0-9-]){1,59}(?<!-)$'
+    ConstraintDescription: Lowercase letters, numbers, and hyphens only
+  DatabasePassword:
+    Type: String
+    Default: secret123
+    Description: The master password for the database
+    MinLength: 8
+
+Resources:
+  #### RDS ####
+  # You probably already have a database, but if not here is one #
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: 16.2
+      DBClusterIdentifier: !Sub "${ResourcePrefix}-db-cluster"
+      DatabaseName: postgresdb
+      MasterUsername: testuser
+      MasterUserPassword: !Ref DatabasePassword
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 8
+      PreferredBackupWindow: 03:00-03:30
+      BackupRetentionPeriod: 7
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt VPC.DefaultSecurityGroup
+
+  RdsSnapshotCreatedEventSubscription:
+    Type: AWS::RDS::EventSubscription
+    Properties:
+      SubscriptionName: !Sub "${ResourcePrefix}-rds-snapshot-created-event-subscription"
+      SnsTopicArn: !Ref RdsSnapshotCreatedTopic
+      SourceType: db-cluster-snapshot
+      EventCategories:
+        - backup
+      Enabled: true
+
+  #### S3 ####
+  DatabaseBackupS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt KmsKey.Arn
+      BucketName: !Sub "${ResourcePrefix}-backup"
+      Tags:
+        - Key: layer
+          Value: database
+
+  #### SNS ####
+  RdsSnapshotCreatedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: RDS Snapshot Created
+      FifoTopic: false
+      TopicName: RdsSnapshotCreated
+      KmsMasterKeyId: !Ref KmsKey
+
+  RdsSnapshotCreatedSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref RdsSnapshotCreatedTopic
+      FilterPolicy:
+        EventID:
+          - RDS-EVENT-0169 # for automated snapshots
+          # - RDS-EVENT-0075 for manual snapshots
+      Endpoint: !GetAtt TriggerS3ExportFunction.Arn
+      Protocol: lambda
+
+  #### KMS ####
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Created by CF Stack: ${AWS::StackId}'
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Id: key-consolepolicy-3
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: "*"
+          - Sid: Enable RDS event Permissions
+            Effect: Allow
+            Principal:
+              Service:
+                - events.rds.amazonaws.com
+            Action: kms:*
+            Resource: "*"
+
+  #### IAM ####
+  RdsExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - export.rds.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Description: !Sub 'Rds Export Role Created by CF Stack: ${AWS::StackId}'
+      Policies:
+        - PolicyName: rds-export-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncryptTo
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:DescribeKey
+                  - kms:RetireGrant
+                  - kms:CreateGrant
+                  - kms:ReEncryptFrom
+                Resource: !GetAtt KmsKey.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DatabaseBackupS3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject*
+                  - s3:GetObject*
+                  - s3:DeleteObject*
+                Resource:
+                  - !Sub "${DatabaseBackupS3Bucket.Arn}/*"
+
+  RdsExportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Description: !Sub 'Lambda Function Role Created by CF Stack: ${AWS::StackId}'
+      Policies:
+        - PolicyName: rds-export-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:StartExportTask
+                Resource:
+                  - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster-snapshot:*"
+                  - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster-snapshot:rds:${DbCluster}-*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt RdsExportRole.Arn
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                Resource: !GetAtt KmsKey.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/AwsSnapshotToS3:*"
+
+  LambdaFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerS3ExportFunction
+      Principal: sns.amazonaws.com
+
+  #### Lambda ####
+
+  TriggerS3ExportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Exports AWS Cluster Snapshot to S3
+      FunctionName: AwsSnapshotToS3
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt RdsExportLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 15
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref DatabaseBackupS3Bucket
+          IAM_ROLE_ARN: !GetAtt RdsExportRole.Arn
+          KMS_ARN: !GetAtt KmsKey.Arn
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          session = boto3.Session()
+          rds_client = session.client('rds')
+          
+          def lambda_handler(event, context):
+            logger.info(event)
+            source_arn = event["Records"][0]["Sns"]["MessageAttributes"]["Resource"]["Value"]
+            result = rds_client.start_export_task(
+              ExportTaskIdentifier=source_arn.split(":")[-1],
+              SourceArn=source_arn,
+              S3BucketName=os.environ.get('S3_BUCKET_NAME'),
+              IamRoleArn=os.environ.get('IAM_ROLE_ARN'),
+              KmsKeyId=os.environ.get('KMS_ARN'),
+              S3Prefix=datetime.today().strftime('%Y/%m/%d')
+            )
+            logger.info(result)
+
+  ### NETWORK ###
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      InstanceTenancy: default
+
+  #### SUBNETs ####
+
+  DbSubnet2a:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Sub "${AWS::Region}a"
+
+  DbSubnet2b:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Sub "${AWS::Region}b"
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: DbSubnetGroup
+      DBSubnetGroupName: DbSubnetGroup
+      SubnetIds:
+        - !Ref DbSubnet2a
+        - !Ref DbSubnet2b
